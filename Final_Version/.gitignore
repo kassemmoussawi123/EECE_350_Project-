@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.client_settings.json
+*.log
+*.tmp
+Thumbs.db
+.DS_Store
+_imported/
