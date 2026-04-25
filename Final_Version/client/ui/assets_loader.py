@@ -20,6 +20,8 @@ class AssetLoader:
         self.assets["snake"] = self._try_image(self.root / "assets" / "images" / "snake_concept.jpg")
         self.assets["icon_orb"] = self._try_image(self.root / "assets" / "icons" / "icon_orb.jpg")
         self.assets["icon_shield"] = self._try_image(self.root / "assets" / "icons" / "icon_shield.jpg")
+        self.assets["badge_alpha"] = self._try_image(self.root / "assets" / "icons" / "badge_alpha.jpg")
+        self.assets["badge_beta"] = self._try_image(self.root / "assets" / "icons" / "badge_beta.jpg")
         self.assets["banner"] = self._try_image(self.root / "assets" / "images" / "banner_strip.jpg")
         self.assets["map_backgrounds"] = {name: self._build_map_background(name) for name in MAPS}
         self.assets["map_previews"] = {name: self._build_map_preview(name) for name in MAPS}

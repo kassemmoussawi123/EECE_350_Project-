@@ -68,7 +68,7 @@ class ArenaRenderer:
             shielded = snapshot.get("buffs", {}).get(name, {}).get("shield", 0) > 0
             self._draw_snake(surface, board_rect, cell_w, cell_h, segments, accent, shielded)
 
-        self._draw_hud(surface, snapshot, local_player, spectator)
+        self._draw_hud(surface, snapshot, local_player, spectator, assets)
         self._draw_feed(surface, side_rect, snapshot)
         self._draw_chat(surface, chat_rect, chat_lines)
 
@@ -76,8 +76,8 @@ class ArenaRenderer:
             overlay = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
             overlay.fill((6, 11, 20, 180))
             surface.blit(overlay, (0, 0))
-            menu = pygame.Rect(width // 2 - 220, height // 2 - 170, 440, 340)
-            self.draw_panel(surface, menu, "Pause")
+            menu = pygame.Rect(width // 2 - 250, height // 2 - 190, 500, 380)
+            self.draw_panel(surface, menu, "In-Game Settings")
             pause_state = snapshot.get("pause_state", {})
             if pause_state.get("is_paused"):
                 info = self.theme.fonts["caption"].render(
@@ -85,10 +85,7 @@ class ArenaRenderer:
                     True,
                     self.theme.colors["accent_soft"],
                 )
-                surface.blit(info, (menu.x + 30, menu.y + 52))
-            for index, line in enumerate(("Resume / Back", "Volume -", "Volume +", "Mute/Unmute", "Open Settings", "Quit Match")):
-                label = self.theme.fonts["body"].render(line, True, self.theme.colors["text"])
-                surface.blit(label, (menu.x + 30, menu.y + 92 + index * 38))
+                surface.blit(info, (menu.x + 30, menu.y + 54))
 
     def _draw_grid(self, surface: pygame.Surface, rect: pygame.Rect, palette: Dict) -> None:
         fill = palette.get("field", self.theme.colors["board"])
@@ -124,7 +121,7 @@ class ArenaRenderer:
                 if shielded:
                     pygame.draw.rect(surface, self.theme.colors["power_shield"], box.inflate(6, 6), 2, border_radius=12)
 
-    def _draw_hud(self, surface: pygame.Surface, snapshot: Dict, local_player: str, spectator: bool) -> None:
+    def _draw_hud(self, surface: pygame.Surface, snapshot: Dict, local_player: str, spectator: bool, assets: Dict[str, pygame.Surface | None]) -> None:
         title = self.theme.fonts["title"].render("\u03A0thon Arena", True, self.theme.colors["text"])
         surface.blit(title, (36, 26))
         subtitle = "Spectator Mode" if spectator else f"Pilot: {local_player}"
@@ -133,30 +130,61 @@ class ArenaRenderer:
 
         timer = self.theme.fonts["small_title"].render(format_clock(snapshot.get("time_left", 0)), True, self.theme.colors["accent_soft"])
         surface.blit(timer, (surface.get_width() - 170, 30))
+        target_score = self.theme.fonts["caption"].render(f"Target: {snapshot.get('target_score', 0)}", True, self.theme.colors["accent_soft"])
+        surface.blit(target_score, (surface.get_width() - 170, 68))
 
         scores = snapshot.get("scores", {})
         health = snapshot.get("health", {})
         buffs = snapshot.get("buffs", {})
         pauses_left = snapshot.get("pause_state", {}).get("pauses_left", {})
-        left = 360
-        for name in snapshot.get("players", []):
-            label = self.theme.fonts["body"].render(
-                f"{name}  Score {scores.get(name, 0)}  HP {health.get(name, 0)}",
+        players = snapshot.get("players", [])
+        heads = {name: (snapshot.get("snakes", {}).get(name) or [(0, 0)])[0] for name in players}
+        cards_left = 332
+        available_width = surface.get_width() - cards_left - 200
+        card_width = max(220, min(300, (available_width - 20) // max(1, len(players))))
+        badges = [assets.get("badge_alpha"), assets.get("badge_beta")]
+        for index, name in enumerate(players):
+            left = cards_left + index * (card_width + 20)
+            card = pygame.Rect(left, 20, card_width, 76)
+            pygame.draw.rect(surface, self.theme.colors["panel"], card, border_radius=16)
+            pygame.draw.rect(surface, self.theme.colors["panel_border"], card, 2, border_radius=16)
+            badge = badges[index] if index < len(badges) else None
+            if badge:
+                icon = pygame.transform.smoothscale(badge, (34, 34))
+                surface.blit(icon, (card.x + 12, card.y + 12))
+            name_label = self.theme.fonts["caption"].render(name[:12], True, self.theme.colors["text"])
+            surface.blit(name_label, (card.x + 56, card.y + 10))
+            hp_value = health.get(name, 0)
+            hp_bar = pygame.Rect(card.x + 56, card.y + 34, card.width - 72, 12)
+            pygame.draw.rect(surface, self.theme.colors["input"], hp_bar, border_radius=8)
+            hp_fill = hp_bar.copy()
+            hp_fill.width = int(hp_bar.width * max(0.0, min(1.0, hp_value / 100.0)))
+            pygame.draw.rect(surface, self.theme.colors["success"], hp_fill, border_radius=8)
+            hp_label = self.theme.fonts["tiny"].render(f"HP {hp_value}", True, self.theme.colors["text"])
+            surface.blit(hp_label, (card.x + 56, card.y + 50))
+            opponent = next((other for other in players if other != name), "")
+            distance = 0
+            if opponent:
+                x1, y1 = heads.get(name, (0, 0))
+                x2, y2 = heads.get(opponent, (0, 0))
+                distance = abs(x1 - x2) + abs(y1 - y2)
+            distance_tag = "Far" if distance >= 18 else "Mid" if distance >= 9 else "Close"
+            right_label = self.theme.fonts["tiny"].render(
+                f"Score {scores.get(name, 0)}   Range {distance} {distance_tag}",
                 True,
-                self.theme.colors["text"],
+                self.theme.colors["accent_soft"],
             )
-            surface.blit(label, (left, 34))
+            surface.blit(right_label, (card.x + 122, card.y + 50))
             effects = []
             if buffs.get(name, {}).get("shield", 0) > 0:
                 effects.append("Shield")
             if buffs.get(name, {}).get("boost", 0) > 0:
                 effects.append("Boost")
-            if effects:
-                buff = self.theme.fonts["caption"].render(", ".join(effects), True, self.theme.colors["accent"])
-                surface.blit(buff, (left, 60))
             pause_tag = self.theme.fonts["caption"].render(f"Pauses Left: {pauses_left.get(name, 3)}", True, self.theme.colors["warning"])
-            surface.blit(pause_tag, (left, 82))
-            left += 250
+            surface.blit(pause_tag, (card.x + card.width - 116, card.y + 10))
+            if effects:
+                buff = self.theme.fonts["tiny"].render(", ".join(effects), True, self.theme.colors["accent"])
+                surface.blit(buff, (card.x + card.width - 116, card.y + 30))
 
     def _draw_feed(self, surface: pygame.Surface, rect: pygame.Rect, snapshot: Dict) -> None:
         y = rect.y + 54

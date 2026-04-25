@@ -171,7 +171,7 @@ class ListBox:
                 pygame.draw.rect(surface, self.theme.colors["accent_soft"], inner, 1, border_radius=9)
             elif index == self.hovered_index:
                 pygame.draw.rect(surface, self.theme.colors["hover"], row, border_radius=8)
-            label = self.theme.fonts["caption"].render(item[:24], True, self.theme.colors["text"])
+            label = self.theme.fonts["caption"].render(item[:42], True, self.theme.colors["text"])
             surface.blit(label, (row.x + 12, row.y + 4))
             if index == self.selected_index:
                 check = self.theme.fonts["caption"].render("✓", True, self.theme.colors["accent_soft"])

@@ -7,6 +7,11 @@ VERSION = "1.0.0"
 
 SCREEN_WIDTH = 1200
 SCREEN_HEIGHT = 720
+USERNAME_MIN_LENGTH = 3
+USERNAME_MAX_LENGTH = 12
+INVITE_TTL_SECONDS = 30
+TARGET_SCORE_TO_WIN = 400
+MAX_TARGET_SCORE = 4000
 
 GRID_WIDTH = 36
 GRID_HEIGHT = 24
@@ -34,7 +39,7 @@ DEFAULT_PROFILE = {
     "snake_skin": "classic",
     "map": "Desert",
     "duration": 2,
-    "target_score": 60,
+    "target_score": TARGET_SCORE_TO_WIN,
     "visual_mod": "Classic Glow",
 }
 

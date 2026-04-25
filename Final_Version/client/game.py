@@ -7,6 +7,7 @@ from typing import Dict
 
 import pygame
 
+from client.audio import SoundManager
 from client.network import NetworkClient
 from client.renderer import ArenaRenderer
 from client.settings import SettingsStore
@@ -28,6 +29,7 @@ from client.ui.screens import (
 )
 from client.ui.theme import build_theme
 from shared.constants import DEFAULT_CONTROLS, DEFAULT_PROFILE, DEFAULT_UI_SETTINGS, MAPS, SCREEN_HEIGHT, SCREEN_WIDTH
+from shared.helpers import clamp_target_score
 
 
 class GameClientApp:
@@ -45,6 +47,7 @@ class GameClientApp:
         self.clock = pygame.time.Clock()
         self.theme = build_theme()
         self.assets = AssetLoader(self.root).load()
+        self.sound = SoundManager(self.root)
         self.renderer = ArenaRenderer(self.theme)
         self.network = NetworkClient()
         self.running = True
@@ -52,6 +55,7 @@ class GameClientApp:
         self.username = ""
         self.profile = DEFAULT_PROFILE.copy()
         self.profile.update(self.settings.data.get("profile", {}))
+        self.profile["target_score"] = clamp_target_score(self.profile.get("target_score", 0))
         self.controls = DEFAULT_CONTROLS.copy()
         self.controls.update(self.settings.data.get("controls", {}))
         self.ui_settings = DEFAULT_UI_SETTINGS.copy()
@@ -59,7 +63,10 @@ class GameClientApp:
         self.status_message = ""
         self.pending_invite_text = ""
         self.pending_invite_target = ""
+        self.pending_invite_deadline = 0.0
         self.incoming_inviter = ""
+        self.incoming_invite_deadline = 0.0
+        self.awaiting_match_start = False
         self.lobby_users: list[Dict] = []
         self.active_matches: list[Dict] = []
         self.lobby_messages: list[str] = []
@@ -99,6 +106,7 @@ class GameClientApp:
         }
         self.current_screen = self.screens["splash"]
         self.apply_audio_volume()
+        self.sound.sync_for_screen("splash")
 
     def run(self) -> None:
         while self.running:
@@ -118,6 +126,9 @@ class GameClientApp:
     def set_screen(self, name: str) -> None:
         self.current_screen = self.screens[name]
         self.current_screen.on_enter()
+        self.sound.sync_for_screen(name)
+        if self.sound.last_error and not self.status_message:
+            self.status_message = self.sound.last_error
 
     def connect(self, host: str, port: int, username: str) -> None:
         try:
@@ -143,6 +154,7 @@ class GameClientApp:
         self.running = False
 
     def push_profile(self) -> None:
+        self.profile["target_score"] = clamp_target_score(self.profile.get("target_score", 0))
         self.settings.data["profile"] = self.profile.copy()
         self.settings.data["controls"] = self.controls.copy()
         self.settings.save()
@@ -163,12 +175,40 @@ class GameClientApp:
     def send_invite(self, target: str) -> None:
         self.pending_invite_target = target
         self.pending_invite_text = f"Invite pending for {target}."
+        self.pending_invite_deadline = 0.0
         self.network.send({"type": "invite_player", "target": target})
         self.set_screen("matchmaking")
 
     def forfeit_match(self) -> None:
         self.network.send({"type": "forfeit_match"})
         self.set_screen("lobby")
+
+    def leave_match(self) -> None:
+        self.network.send({"type": "leave_match"})
+
+    def update_audio_settings(self, music: int | None = None, sfx: int | None = None, mute: bool | None = None) -> None:
+        if music is not None:
+            self.settings.data["ui"]["music_volume"] = max(0, min(100, int(music)))
+        if sfx is not None:
+            self.settings.data["ui"]["sfx_volume"] = max(0, min(100, int(sfx)))
+        if mute is not None:
+            self.settings.data["ui"]["mute"] = bool(mute)
+        self.settings.save()
+        self.apply_audio_volume()
+
+    def set_invite_deadline(self, seconds_remaining: int, incoming: bool) -> None:
+        deadline = pygame.time.get_ticks() / 1000.0 + max(0, seconds_remaining)
+        if incoming:
+            self.incoming_invite_deadline = deadline
+        else:
+            self.pending_invite_deadline = deadline
+
+    def invite_seconds_left(self, incoming: bool) -> int:
+        deadline = self.incoming_invite_deadline if incoming else self.pending_invite_deadline
+        if deadline <= 0:
+            return 0
+        remaining = deadline - (pygame.time.get_ticks() / 1000.0)
+        return max(0, int(remaining + 0.999))
 
     def toggle_mute(self) -> None:
         current = self.settings.data["ui"]["mute"]
@@ -183,10 +223,8 @@ class GameClientApp:
         self.apply_audio_volume()
 
     def apply_audio_volume(self) -> None:
-        if not pygame.mixer.get_init():
-            return
         volume = 0.0 if self.settings.data["ui"]["mute"] else self.settings.data["ui"]["music_volume"] / 100.0
-        pygame.mixer.music.set_volume(volume)
+        self.sound.apply_volume(volume)
 
     def key_to_action(self, key: int) -> str:
         arrow_map = {
@@ -252,41 +290,68 @@ class GameClientApp:
             if pending:
                 invite = pending[-1]
                 self.incoming_inviter = invite["from"]
+                self.set_invite_deadline(invite.get("expires_in", 0), incoming=True)
                 self.pending_invite_text = f"{invite['from']} invited you. Press Y to accept or N to reject in lobby."
-            elif not self.pending_invite_target:
+            elif not self.pending_invite_target and not self.awaiting_match_start:
                 self.incoming_inviter = ""
+                self.incoming_invite_deadline = 0.0
                 self.pending_invite_text = ""
         elif msg_type == "lobby_chat":
             self.lobby_messages.append(f"{message['from']}: {message['text']}")
         elif msg_type == "invite_sent":
             self.pending_invite_target = message.get("target", "")
+            self.set_invite_deadline(message.get("expires_in", 0), incoming=False)
             self.pending_invite_text = f"Invite sent to {self.pending_invite_target}."
             self.set_screen("matchmaking")
         elif msg_type == "invite_received":
+            self.awaiting_match_start = False
             self.incoming_inviter = message["from"]
+            self.set_invite_deadline(message.get("expires_in", 0), incoming=True)
             self.pending_invite_text = f"{message['from']} invited you. Press Y to accept or N to reject."
             if self.current_screen not in (self.screens["game"], self.screens["spectator"], self.screens["matchmaking"]):
                 self.set_screen("lobby")
             self.request_lobby_refresh()
         elif msg_type == "invite_cancelled":
+            self.awaiting_match_start = False
             self.pending_invite_text = "Invite was cancelled."
             self.pending_invite_target = ""
+            self.pending_invite_deadline = 0.0
             self.incoming_inviter = ""
+            self.incoming_invite_deadline = 0.0
             self.set_screen("lobby")
+        elif msg_type == "invite_expired":
+            self.awaiting_match_start = False
+            self.pending_invite_text = message.get("message", "Invitation expired")
+            self.pending_invite_target = ""
+            self.pending_invite_deadline = 0.0
+            self.incoming_inviter = ""
+            self.incoming_invite_deadline = 0.0
+            if self.current_screen is self.screens["matchmaking"]:
+                self.set_screen("lobby")
         elif msg_type == "invite_response":
             if message.get("status") == "accepted":
+                self.awaiting_match_start = True
                 self.pending_invite_target = ""
+                self.pending_invite_deadline = 0.0
                 self.pending_invite_text = "Invite accepted. Preparing match..."
             else:
+                self.awaiting_match_start = False
                 self.pending_invite_target = ""
+                self.pending_invite_deadline = 0.0
                 self.incoming_inviter = ""
+                self.incoming_invite_deadline = 0.0
                 self.pending_invite_text = f"Invite {message.get('status')}."
                 self.set_screen("lobby")
         elif msg_type == "match_started":
+            self.awaiting_match_start = False
             self.spectating = False
             self.last_opponent = next((name for name in message.get("players", []) if name != self.username), "")
             self.match_chat.clear()
             self.match_snapshot = message.get("snapshot", self.match_snapshot)
+            self.pending_invite_deadline = 0.0
+            self.incoming_invite_deadline = 0.0
+            self.pending_invite_text = ""
+            self.incoming_inviter = ""
             self.set_screen("game")
         elif msg_type == "spectate_started":
             self.spectating = True
@@ -300,8 +365,18 @@ class GameClientApp:
         elif msg_type == "reaction":
             self.match_chat.append(f"{message['from']} reacted {message['emoji']}")
         elif msg_type == "match_over":
+            self.awaiting_match_start = False
             self.match_result = {"winner": message.get("winner", "Unknown"), "scores": message.get("scores", {})}
             self.match_snapshot = message.get("snapshot", self.match_snapshot)
             self.pending_invite_text = ""
             self.pending_invite_target = ""
-            self.set_screen("endgame")
+            self.pending_invite_deadline = 0.0
+            self.incoming_inviter = ""
+            self.incoming_invite_deadline = 0.0
+            if message.get("message"):
+                self.status_message = message["message"]
+            if message.get("reason") == "player_left" and message.get("left_by") == self.username:
+                self.request_lobby_refresh()
+                self.set_screen("lobby")
+            else:
+                self.set_screen("endgame")

@@ -9,7 +9,8 @@ from typing import List
 import pygame
 
 from client.ui.widgets import Button, InputField, ListBox, Slider, Toggle, draw_paragraph
-from shared.constants import MAP_CHOICES, SNAKE_SKINS
+from shared.constants import MAP_CHOICES, MAX_TARGET_SCORE, SNAKE_SKINS, TARGET_SCORE_TO_WIN, USERNAME_MAX_LENGTH
+from shared.helpers import clamp_target_score, parse_target_score, username_validation_error, valid_username
 
 
 @dataclass
@@ -106,6 +107,7 @@ class ConnectionScreen(BaseScreen):
         self.host = InputField(pygame.Rect(420, 220, 400, 48), app.theme, text=app.settings.data["connection"]["host"], placeholder="Server IP")
         self.port = InputField(pygame.Rect(420, 300, 400, 48), app.theme, text=str(app.settings.data["connection"]["port"]), placeholder="Port")
         self.username = InputField(pygame.Rect(420, 380, 400, 48), app.theme, text=app.settings.data["connection"]["username"], placeholder="Username")
+        self.username.max_length = USERNAME_MAX_LENGTH
         self.buttons = [
             Button(pygame.Rect(420, 470, 180, 54), "Connect", self._connect, app.theme),
             Button(pygame.Rect(640, 470, 180, 54), "Back", lambda: app.set_screen("menu"), app.theme, accent="accent_2"),
@@ -119,8 +121,8 @@ class ConnectionScreen(BaseScreen):
         except ValueError:
             self.error = "Port must be numeric."
             return
-        if not self.username.text.strip():
-            self.error = "Username is required."
+        self.error = username_validation_error(self.username.text.strip())
+        if self.error:
             return
         self.app.connect(self.host.text.strip() or "127.0.0.1", port, self.username.text.strip())
 
@@ -134,6 +136,7 @@ class ConnectionScreen(BaseScreen):
 
     def draw(self, surface: pygame.Surface) -> None:
         self.app.renderer.draw_background(surface, self.app.assets.get("background"), 110)
+        self.buttons[0].disabled = not valid_username(self.username.text.strip())
         card = pygame.Rect(320, 120, 600, 500)
         self.app.renderer.draw_panel(surface, card, "Connection")
         for label, y in (("Server IP", 190), ("Port", 270), ("Username", 350)):
@@ -141,6 +144,8 @@ class ConnectionScreen(BaseScreen):
             surface.blit(text, (420, y))
         for field in (self.host, self.port, self.username):
             field.draw(surface)
+        username_hint = self.app.theme.fonts["tiny"].render("3-12 characters: letters, numbers, underscore.", True, self.app.theme.colors["muted"])
+        surface.blit(username_hint, (420, 435))
         for button in self.buttons:
             button.draw(surface)
         status = self.error or self.app.status_message
@@ -210,11 +215,14 @@ class LobbyScreen(BaseScreen):
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_y and self.app.incoming_inviter:
             self.app.network.send({"type": "respond_invite", "inviter": self.app.incoming_inviter, "accept": True})
             self.app.pending_invite_text = "Invite accepted. Waiting for match start..."
-            self.app.incoming_inviter = ""
+            self.app.awaiting_match_start = True
+            self.app.request_lobby_refresh()
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_n and self.app.incoming_inviter:
             self.app.network.send({"type": "respond_invite", "inviter": self.app.incoming_inviter, "accept": False})
             self.app.pending_invite_text = "Invite declined."
+            self.app.awaiting_match_start = False
             self.app.incoming_inviter = ""
+            self.app.request_lobby_refresh()
 
     def update(self, dt: float) -> None:
         # Poll lobby state regularly so other connected clients appear without manual refresh.
@@ -228,7 +236,10 @@ class LobbyScreen(BaseScreen):
             if item["username"] != self.app.username and item.get("status") == "lobby"
         ]
         self.user_list.items = others
-        self.match_list.items = [f"{m['match_id']} | {' vs '.join(m['players'])}" for m in self.app.active_matches]
+        self.match_list.items = [
+            f"{m['match_id']} | {' vs '.join(m['players'])} | {m.get('map', 'Desert')} | {m.get('target_score', TARGET_SCORE_TO_WIN)} pts"
+            for m in self.app.active_matches
+        ]
 
     def draw(self, surface: pygame.Surface) -> None:
         self.app.renderer.draw_background(surface, self.app.assets.get("background"), 115)
@@ -250,6 +261,8 @@ class LobbyScreen(BaseScreen):
             surface.blit(label, (60, y))
             y += 26
         status = self.app.pending_invite_text or self.app.status_message
+        if self.app.incoming_inviter:
+            status = f"{self.app.pending_invite_text} ({self.app.invite_seconds_left(incoming=True)}s)"
         if status:
             status_box = pygame.Rect(40, 72, 640, 40)
             pygame.draw.rect(surface, self.app.theme.colors["input"], status_box, border_radius=12)
@@ -352,20 +365,30 @@ class MatchSettingsScreen(BaseScreen):
     def __init__(self, app: "GameClientApp") -> None:
         super().__init__(app)
         selected_map = MAP_CHOICES.index(app.profile["map"]) if app.profile["map"] in MAP_CHOICES else 0
+        self.panel = pygame.Rect(120, 80, 450, 610)
+        self.hint_panel = pygame.Rect(620, 80, 500, 610)
         self.map_list = ListBox(pygame.Rect(160, 220, 260, 110), app.theme, items=list(MAP_CHOICES), selected_index=selected_map)
         self.duration_field = InputField(pygame.Rect(160, 372, 260, 44), app.theme, text=str(app.profile["duration"]), placeholder="Duration")
         self.target_field = InputField(pygame.Rect(160, 452, 260, 44), app.theme, text=str(app.profile["target_score"]), placeholder="Target Score")
-        self.visual_field = InputField(pygame.Rect(160, 532, 260, 44), app.theme, text=app.profile["visual_mod"], placeholder="Visual Variation")
-        self.save_button = Button(pygame.Rect(160, 588, 180, 46), "Confirm", self._save, app.theme)
-        self.back_button = Button(pygame.Rect(360, 588, 180, 46), "Back", lambda: app.set_screen("lobby"), app.theme, accent="accent_2")
+        self.target_field.max_length = len(str(MAX_TARGET_SCORE))
+        self.visual_field = InputField(pygame.Rect(160, 592, 260, 44), app.theme, text=app.profile["visual_mod"], placeholder="Visual Variation")
+        self.save_button = Button(pygame.Rect(160, 652, 180, 46), "Confirm", self._save, app.theme)
+        self.back_button = Button(pygame.Rect(360, 652, 180, 46), "Back", lambda: app.set_screen("lobby"), app.theme, accent="accent_2")
+
+    def _sanitize_target_field(self) -> None:
+        raw = "".join(ch for ch in self.target_field.text if ch.isdigit())
+        if not raw:
+            self.target_field.text = ""
+            return
+        self.target_field.text = str(clamp_target_score(int(raw)))
 
     def _save(self) -> None:
         try:
             duration = int(self.duration_field.text.strip())
-            target = int(self.target_field.text.strip())
         except ValueError:
-            self.app.status_message = "Duration and target score must be numbers."
+            self.app.status_message = "Duration must be numeric."
             return
+        target = parse_target_score(self.target_field.text)
         self.app.profile.update(
             {
                 # Store the chosen map here before profile sync/network send.
@@ -375,6 +398,8 @@ class MatchSettingsScreen(BaseScreen):
                 "visual_mod": self.visual_field.text.strip() or "Classic Glow",
             }
         )
+        if self.target_field.text.strip():
+            self.target_field.text = str(target)
         self.app.push_profile()
         self.app.set_screen("lobby")
 
@@ -384,16 +409,15 @@ class MatchSettingsScreen(BaseScreen):
         self.app.profile["map"] = self.map_list.selected or "Desert"
         for field in (self.duration_field, self.target_field, self.visual_field):
             field.handle_event(event)
+        self._sanitize_target_field()
         self.save_button.handle_event(event)
         self.back_button.handle_event(event)
 
     def draw(self, surface: pygame.Surface) -> None:
         self.app.renderer.draw_background(surface, self.app.assets.get("background"), 120)
-        panel = pygame.Rect(120, 100, 450, 560)
-        hint = pygame.Rect(620, 100, 500, 560)
-        self.app.renderer.draw_panel(surface, panel, "Match Settings")
-        self.app.renderer.draw_panel(surface, hint, "Map Preview")
-        for label, y in (("Map", 190), ("Duration (minutes)", 342), ("Target Score", 422), ("Visual Variation", 502)):
+        self.app.renderer.draw_panel(surface, self.panel, "Match Settings")
+        self.app.renderer.draw_panel(surface, self.hint_panel, "Map Preview")
+        for label, y in (("Map", 190), ("Duration (minutes)", 342), ("Target Score", 422), ("Visual Variation", 562)):
             text = self.app.theme.fonts["caption"].render(label, True, self.app.theme.colors["text"])
             surface.blit(text, (160, y))
         self.map_list.draw(surface)
@@ -409,20 +433,27 @@ class MatchSettingsScreen(BaseScreen):
         preview_map = self.map_list.selected or "Desert"
         map_previews = self.app.assets.get("map_previews", {})
         preview_surface = map_previews.get(preview_map) if isinstance(map_previews, dict) else None
-        preview_box = pygame.Rect(hint.x + 28, hint.y + 56, 444, 252)
+        preview_box = pygame.Rect(self.hint_panel.x + 28, self.hint_panel.y + 56, 444, 252)
         pygame.draw.rect(surface, self.app.theme.colors["input"], preview_box, border_radius=18)
         pygame.draw.rect(surface, self.app.theme.colors["accent_soft"], preview_box, 1, border_radius=18)
         if preview_surface:
             surface.blit(preview_surface, (preview_box.x + 2, preview_box.y + 2))
         map_title = self.app.theme.fonts["title"].render(preview_map, True, self.app.theme.colors["accent_soft"])
-        surface.blit(map_title, map_title.get_rect(center=(hint.centerx, hint.y + 356)))
+        surface.blit(map_title, map_title.get_rect(center=(self.hint_panel.centerx, self.hint_panel.y + 356)))
         descriptions = {
             "Desert": "Warm dunes, earthy grid tones, and sandstone obstacle colors.",
             "Snow": "Icy scenery, cool board tones, and bright frosted object colors.",
             "Jungle": "Dense greenery, deep green board tones, and vivid natural accents.",
         }
-        draw_paragraph(surface, self.app.theme, descriptions.get(preview_map, ""), hint.x + 34, hint.y + 392, hint.width - 68)
-        draw_paragraph(surface, self.app.theme, "The selected map is saved to your profile and sent to the server before matchmaking begins.", hint.x + 34, hint.y + 462, hint.width - 68)
+        draw_paragraph(surface, self.app.theme, descriptions.get(preview_map, ""), self.hint_panel.x + 34, self.hint_panel.y + 392, self.hint_panel.width - 68)
+        draw_paragraph(surface, self.app.theme, "The selected map is saved to your profile and sent to the server before matchmaking begins.", self.hint_panel.x + 34, self.hint_panel.y + 462, self.hint_panel.width - 68)
+        target_note = pygame.Rect(160, 506, 300, 42)
+        pygame.draw.rect(surface, self.app.theme.colors["input"], target_note, border_radius=12)
+        pygame.draw.rect(surface, self.app.theme.colors["panel_border"], target_note, 1, border_radius=12)
+        note_title = self.app.theme.fonts["tiny"].render("Score Limit", True, self.app.theme.colors["accent_soft"])
+        note_body = self.app.theme.fonts["tiny"].render(f"Custom range: 1 to {MAX_TARGET_SCORE}", True, self.app.theme.colors["muted"])
+        surface.blit(note_title, (target_note.x + 12, target_note.y + 6))
+        surface.blit(note_body, (target_note.x + 12, target_note.y + 20))
 
 
 class MatchmakingScreen(BaseScreen):
@@ -450,7 +481,9 @@ class MatchmakingScreen(BaseScreen):
         dots = "." * (1 + int(self.timer * 2) % 3)
         title = self.app.theme.fonts["title"].render(f"Invite sent to {self.app.pending_invite_target}{dots}", True, self.app.theme.colors["text"])
         surface.blit(title, (390, 260))
-        note = self.app.theme.fonts["caption"].render(self.app.pending_invite_text or "The lobby will update when your opponent responds.", True, self.app.theme.colors["accent_soft"])
+        seconds_left = self.app.invite_seconds_left(incoming=False)
+        waiting_text = self.app.pending_invite_text or "The lobby will update when your opponent responds."
+        note = self.app.theme.fonts["caption"].render(f"{waiting_text} Expires in {seconds_left}s.", True, self.app.theme.colors["accent_soft"])
         surface.blit(note, (390, 320))
         self.cancel_button.draw(surface)
 
@@ -578,7 +611,13 @@ class EndGameScreen(BaseScreen):
         summary = self.app.match_result or {"winner": "Unknown", "scores": {}}
         winner = self.app.theme.fonts["title"].render(f"Winner: {summary['winner']}", True, self.app.theme.colors["accent_soft"])
         surface.blit(winner, (390, 250))
-        y = 320
+        target_value = self.app.match_snapshot.get("target_score", self.app.profile.get("target_score", TARGET_SCORE_TO_WIN))
+        target = self.app.theme.fonts["caption"].render(f"Winning Score: {target_value}", True, self.app.theme.colors["muted"])
+        surface.blit(target, (390, 294))
+        if self.app.status_message:
+            status = self.app.theme.fonts["caption"].render(self.app.status_message[:52], True, self.app.theme.colors["accent_soft"])
+            surface.blit(status, (390, 320))
+        y = 352
         for player, score in summary.get("scores", {}).items():
             label = self.app.theme.fonts["body"].render(f"{player}: {score}", True, self.app.theme.colors["text"])
             surface.blit(label, (390, y))
@@ -591,41 +630,69 @@ class GameScreen(BaseScreen):
     def __init__(self, app: "GameClientApp") -> None:
         super().__init__(app)
         self.chat_input = InputField(pygame.Rect(60, 640, 760, 40), app.theme, placeholder="Match chat")
-        self.resume_button = Button(pygame.Rect(440, 348, 320, 42), "Resume / Back", self._resume_game, app.theme)
-        self.volume_down_button = Button(pygame.Rect(440, 392, 150, 42), "Volume -", lambda: app.adjust_music_volume(-10), app.theme, accent="accent_2")
-        self.volume_up_button = Button(pygame.Rect(610, 392, 150, 42), "Volume +", lambda: app.adjust_music_volume(10), app.theme, accent="accent_2")
-        self.mute_button = Button(pygame.Rect(440, 436, 320, 42), "Mute / Unmute", app.toggle_mute, app.theme)
-        self.settings_button = Button(pygame.Rect(440, 480, 320, 42), "Open Settings", lambda: app.set_screen("settings"), app.theme)
-        self.quit_button = Button(pygame.Rect(440, 524, 320, 42), "Quit Match", app.forfeit_match, app.theme, accent="danger")
+        ui = app.settings.data["ui"]
+        self.pause_button = Button(pygame.Rect(1010, 24, 150, 42), "Pause / Settings", self._toggle_pause, app.theme, accent="accent_2")
+        self.resume_button = Button(pygame.Rect(440, 560, 220, 42), "Return to Game", self._resume_game, app.theme)
+        self.quit_button = Button(pygame.Rect(680, 560, 220, 42), "Quit Match", self._open_leave_confirmation, app.theme, accent="danger")
+        self.music_slider = Slider(pygame.Rect(452, 364, 300, 18), app.theme, 0, 100, ui["music_volume"], "Music")
+        self.sfx_slider = Slider(pygame.Rect(452, 426, 300, 18), app.theme, 0, 100, ui["sfx_volume"], "SFX")
+        self.mute_toggle = Toggle(pygame.Rect(452, 468, 300, 36), app.theme, ui["mute"], "Mute")
+        self.confirm_leave = False
+
+    def on_enter(self) -> None:
+        ui = self.app.settings.data["ui"]
+        self.music_slider.value = ui["music_volume"]
+        self.sfx_slider.value = ui["sfx_volume"]
+        self.mute_toggle.value = ui["mute"]
+        self.confirm_leave = False
+
+    def _toggle_pause(self) -> None:
+        if self.app.match_snapshot.get("pause_state", {}).get("is_paused"):
+            self.app.network.send({"type": "resume_pause"})
+        else:
+            self.app.network.send({"type": "request_pause"})
 
     def _resume_game(self) -> None:
+        self.confirm_leave = False
         self.app.network.send({"type": "resume_pause"})
+
+    def _open_leave_confirmation(self) -> None:
+        self.confirm_leave = True
+
+    def _sync_audio_controls(self) -> None:
+        self.app.update_audio_settings(
+            music=self.music_slider.value,
+            sfx=self.sfx_slider.value,
+            mute=self.mute_toggle.value,
+        )
 
     def handle_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             if self.app.match_snapshot.get("pause_state", {}).get("is_paused"):
+                self.confirm_leave = False
                 self.app.network.send({"type": "resume_pause"})
             else:
                 self.app.network.send({"type": "request_pause"})
             return
+        self.pause_button.handle_event(event)
         paused = self.app.match_snapshot.get("pause_state", {}).get("is_paused", False)
         if paused:
             self.resume_button.handle_event(event)
-            self.volume_down_button.handle_event(event)
-            self.volume_up_button.handle_event(event)
-            self.mute_button.handle_event(event)
-            self.settings_button.handle_event(event)
             self.quit_button.handle_event(event)
+            self.music_slider.handle_event(event)
+            self.sfx_slider.handle_event(event)
+            self.mute_toggle.handle_event(event)
+            self._sync_audio_controls()
             if event.type == pygame.KEYDOWN and event.key == pygame.K_q:
-                self.app.forfeit_match()
+                self.confirm_leave = True
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_m:
-                self.app.toggle_mute()
-            elif event.type == pygame.KEYDOWN and event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
-                self.app.adjust_music_volume(-10)
-            elif event.type == pygame.KEYDOWN and event.key in (pygame.K_EQUALS, pygame.K_KP_PLUS):
-                self.app.adjust_music_volume(10)
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_s:
-                self.app.set_screen("settings")
+                self.mute_toggle.value = not self.mute_toggle.value
+                self._sync_audio_controls()
+            elif self.confirm_leave and event.type == pygame.KEYDOWN and event.key == pygame.K_y:
+                self.confirm_leave = False
+                self.app.leave_match()
+            elif self.confirm_leave and event.type == pygame.KEYDOWN and event.key == pygame.K_n:
+                self.confirm_leave = False
             return
         self.chat_input.handle_event(event)
         if event.type == pygame.KEYDOWN:
@@ -644,10 +711,36 @@ class GameScreen(BaseScreen):
     def draw(self, surface: pygame.Surface) -> None:
         paused = self.app.match_snapshot.get("pause_state", {}).get("is_paused", False)
         self.app.renderer.draw_game(surface, self.app.match_snapshot, self.app.username, self.app.assets, False, self.app.match_chat, paused)
+        self.pause_button.draw(surface)
         self.chat_input.draw(surface)
         if paused:
-            for button in (self.resume_button, self.volume_down_button, self.volume_up_button, self.mute_button, self.settings_button, self.quit_button):
+            panel = pygame.Rect(surface.get_width() // 2 - 250, surface.get_height() // 2 - 190, 500, 380)
+            self.music_slider.draw(surface)
+            self.sfx_slider.draw(surface)
+            self.mute_toggle.draw(surface)
+            controls_title = self.app.theme.fonts["caption"].render("Controls", True, self.app.theme.colors["accent_soft"])
+            surface.blit(controls_title, (panel.x + 30, panel.y + 116))
+            controls = [
+                f"Up: {self.app.controls['up'].upper()}",
+                f"Down: {self.app.controls['down'].upper()}",
+                f"Left: {self.app.controls['left'].upper()}",
+                f"Right: {self.app.controls['right'].upper()}",
+                "Chat: Enter",
+                "Pause: Esc",
+            ]
+            for index, line in enumerate(controls):
+                label = self.app.theme.fonts["tiny"].render(line, True, self.app.theme.colors["text"])
+                col = index // 3
+                row = index % 3
+                surface.blit(label, (panel.x + 30 + col * 150, panel.y + 146 + row * 24))
+            for button in (self.resume_button, self.quit_button):
                 button.draw(surface)
+            if self.confirm_leave:
+                confirm_box = pygame.Rect(panel.x + 70, panel.y + 250, 360, 74)
+                pygame.draw.rect(surface, self.app.theme.colors["input"], confirm_box, border_radius=14)
+                pygame.draw.rect(surface, self.app.theme.colors["danger"], confirm_box, 2, border_radius=14)
+                label = self.app.theme.fonts["caption"].render("Leave match and return to lobby? Y = Yes, N = No", True, self.app.theme.colors["text"])
+                surface.blit(label, (confirm_box.x + 18, confirm_box.y + 26))
 
 
 class SpectatorScreen(BaseScreen):

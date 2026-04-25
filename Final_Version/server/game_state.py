@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 from shared.constants import GRID_HEIGHT, GRID_WIDTH, MAPS, MAX_MATCH_CHAT, POWERUP_TYPES
-from shared.helpers import clamp
+from shared.helpers import clamp, clamp_target_score
 
 
 Cell = Tuple[int, int]
@@ -23,12 +23,14 @@ class Match:
     powerups: List[Dict] = field(default_factory=list)
     announcements: List[str] = field(default_factory=list)
     chat_log: List[str] = field(default_factory=list)
+    end_reason: str = ""
+    left_player: str = ""
 
     def __post_init__(self) -> None:
         # The inviter's saved profile is the authoritative source for the match map.
         game_map = self.profiles[self.players[0]]["profile"]["map"]
         duration = int(self.profiles[self.players[0]]["profile"]["duration"])
-        target = int(self.profiles[self.players[0]]["profile"]["target_score"])
+        target = clamp_target_score(self.profiles[self.players[0]]["profile"]["target_score"])
         self.map_name = game_map if game_map in MAPS else "Desert"
         self.palette = MAPS[self.map_name]["palette"]
         self.obstacles = list(MAPS[self.map_name]["obstacles"])
@@ -138,20 +140,18 @@ class Match:
                 self.winner = self._other(player)
                 self.announcements.append(f"{player} disconnected.")
 
-        if self.time_left <= 0:
-            self.over = True
-            self.winner = max(self.players, key=lambda name: (self.scores[name], self.health[name]))
-        for player in self.players:
-            if self.scores[player] >= self.target_score:
-                self.over = True
-                self.winner = player
         alive = [player for player in self.players if self.alive[player]]
         if len(alive) == 1:
             self.over = True
             self.winner = alive[0]
-        elif not alive:
+            return
+        if not alive:
             self.over = True
             self.winner = max(self.players, key=lambda name: self.scores[name])
+            return
+        if self.time_left <= 0:
+            self.over = True
+            self.winner = max(alive, key=lambda name: self.scores[name])
 
     def snapshot(self) -> Dict:
         return {

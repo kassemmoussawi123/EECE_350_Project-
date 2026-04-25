@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 
-from shared.constants import DEFAULT_CONTROLS, DEFAULT_PROFILE, DEFAULT_UI_SETTINGS
+from shared.constants import DEFAULT_CONTROLS, DEFAULT_PROFILE, DEFAULT_UI_SETTINGS, INVITE_TTL_SECONDS
 from shared.helpers import now
 
 
@@ -14,6 +14,9 @@ class Invite:
     inviter: str
     target: str
     created_at: float
+
+    def expires_in(self) -> float:
+        return max(0.0, INVITE_TTL_SECONDS - (now() - self.created_at))
 
 
 def default_profile() -> Dict:

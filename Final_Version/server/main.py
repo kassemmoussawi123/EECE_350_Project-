@@ -18,6 +18,8 @@ from server.lobby import default_profile, new_invite, serialize_users
 from server.protocol import ClientSession
 from server.utils import build_logger, other_player, trim_messages
 from shared.constants import APP_NAME, MAX_LOBBY_MESSAGES, TICK_RATE
+from shared.helpers import clamp_target_score
+import math
 
 
 class ArenaServer:
@@ -103,30 +105,44 @@ class ArenaServer:
         with self.lock:
             profile = self.profiles.setdefault(username, default_profile())
             profile["profile"].update(message.get("profile", {}))
+            profile["profile"]["target_score"] = clamp_target_score(profile["profile"].get("target_score", 0))
             profile["controls"].update(message.get("controls", {}))
             profile["ui_settings"].update(message.get("ui_settings", {}))
         self.send_lobby_state()
 
     def send_lobby_state(self, username: str | None = None) -> None:
         with self.lock:
+            self._expire_invites_locked()
             payload = {
                 "type": "lobby_state",
                 "users": serialize_users({name: data for name, data in self.profiles.items() if name in self.sessions}),
                 "messages": self.lobby_messages[-MAX_LOBBY_MESSAGES:],
                 "active_matches": [
-                    {"match_id": match_id, "players": match.players, "spectators": len(match.spectators)}
+                    {
+                        "match_id": match_id,
+                        "players": match.players,
+                        "spectators": len(match.spectators),
+                        "map": match.map_name,
+                        "target_score": match.target_score,
+                    }
                     for match_id, match in self.active_matches.items()
                 ],
             }
             if username:
-                payload["incoming_invites"] = [{"from": invite.inviter} for invite in self.invites.get(username, [])]
+                payload["incoming_invites"] = [
+                    {"from": invite.inviter, "expires_in": max(0, math.ceil(invite.expires_in()))}
+                    for invite in self.invites.get(username, [])
+                ]
                 session = self.sessions.get(username)
                 if session:
                     session.send(payload)
                 return
             for user, session in self.sessions.items():
                 user_payload = dict(payload)
-                user_payload["incoming_invites"] = [{"from": invite.inviter} for invite in self.invites.get(user, [])]
+                user_payload["incoming_invites"] = [
+                    {"from": invite.inviter, "expires_in": max(0, math.ceil(invite.expires_in()))}
+                    for invite in self.invites.get(user, [])
+                ]
                 session.send(user_payload)
 
     def send_lobby_chat(self, username: str, text: str) -> None:
@@ -141,6 +157,7 @@ class ArenaServer:
 
     def send_invite(self, inviter: str, target: str) -> None:
         with self.lock:
+            self._expire_invites_locked()
             if target == inviter:
                 self.sessions[inviter].send({"type": "error", "message": "Choose another player."})
                 return
@@ -154,8 +171,9 @@ class ArenaServer:
             self.invites.setdefault(target, [])
             self.invites[target] = [item for item in self.invites[target] if item.inviter != inviter]
             self.invites[target].append(invite)
-            self.sessions[inviter].send({"type": "invite_sent", "target": target})
-            self.sessions[target].send({"type": "invite_received", "from": inviter})
+            expires_in = max(0, math.ceil(invite.expires_in()))
+            self.sessions[inviter].send({"type": "invite_sent", "target": target, "expires_in": expires_in})
+            self.sessions[target].send({"type": "invite_received", "from": inviter, "expires_in": expires_in})
         self.send_lobby_state()
 
     def cancel_invite(self, inviter: str, target: str) -> None:
@@ -168,10 +186,19 @@ class ArenaServer:
 
     def respond_invite(self, username: str, inviter: str, accept: bool) -> None:
         with self.lock:
+            self._expire_invites_locked()
             invites = self.invites.get(username, [])
             matched = next((invite for invite in invites if invite.inviter == inviter), None)
             if not matched:
                 self.sessions[username].send({"type": "error", "message": "Invite not found."})
+                return
+            if matched.expires_in() <= 0:
+                self.invites[username] = [invite for invite in invites if invite.inviter != inviter]
+                inviter_session = self.sessions.get(inviter)
+                if inviter_session:
+                    inviter_session.send({"type": "invite_expired", "role": "sender", "target": username, "message": "Invitation expired"})
+                self.sessions[username].send({"type": "invite_expired", "role": "receiver", "from": inviter, "message": "Invitation expired"})
+                self.send_lobby_state()
                 return
             self.invites[username] = [invite for invite in invites if invite.inviter != inviter]
             if not accept:
@@ -274,12 +301,25 @@ class ArenaServer:
             match.winner = opponent
             match.announcements.append(f"{username} {'disconnected' if disconnected else 'forfeited'}.")
 
+    def leave_match(self, username: str) -> None:
+        with self.lock:
+            match = self._match_for_user(username)
+            if not match:
+                return
+            opponent = other_player(match.players, username)
+            match.over = True
+            match.winner = opponent
+            match.end_reason = "player_left"
+            match.left_player = username
+            match.announcements.append(f"{username} left the match.")
+
     def match_loop(self) -> None:
         interval = 1 / TICK_RATE
         while True:
             time.sleep(interval)
             finished: list[str] = []
             with self.lock:
+                self._expire_invites_locked()
                 connected = set(self.sessions)
                 for match_id, match in self.active_matches.items():
                     match.step(interval, connected)
@@ -298,13 +338,22 @@ class ArenaServer:
         if not match:
             return
         snapshot = match.snapshot()
-        payload = {"type": "match_over", "winner": match.winner, "scores": match.scores, "snapshot": snapshot}
         for player in match.players:
             if player in self.profiles and player in self.sessions:
                 self.profiles[player]["status"] = "lobby"
                 self.profiles[player]["current_match"] = ""
             session = self.sessions.get(player)
             if session:
+                payload = {
+                    "type": "match_over",
+                    "winner": match.winner,
+                    "scores": match.scores,
+                    "snapshot": snapshot,
+                    "reason": match.end_reason,
+                    "left_by": match.left_player,
+                }
+                if match.end_reason == "player_left":
+                    payload["message"] = "You left the match." if player == match.left_player else "Opponent left match"
                 session.send(payload)
         for spectator in list(match.spectators):
             if spectator in self.profiles and spectator in self.sessions:
@@ -312,7 +361,17 @@ class ArenaServer:
                 self.profiles[spectator]["current_match"] = ""
             session = self.sessions.get(spectator)
             if session:
-                session.send(payload)
+                session.send(
+                    {
+                        "type": "match_over",
+                        "winner": match.winner,
+                        "scores": match.scores,
+                        "snapshot": snapshot,
+                        "reason": match.end_reason,
+                        "left_by": match.left_player,
+                        "message": "A player left the match." if match.end_reason == "player_left" else "",
+                    }
+                )
             self.spectator_lookup.pop(spectator, None)
         self.send_lobby_state()
 
@@ -322,6 +381,24 @@ class ArenaServer:
             return None
         match_id = profile.get("current_match", "")
         return self.active_matches.get(match_id)
+
+    def _expire_invites_locked(self) -> None:
+        expired: list[tuple[str, str]] = []
+        for target, invites in list(self.invites.items()):
+            active = []
+            for invite in invites:
+                if invite.expires_in() <= 0:
+                    expired.append((invite.inviter, target))
+                else:
+                    active.append(invite)
+            self.invites[target] = active
+        for inviter, target in expired:
+            inviter_session = self.sessions.get(inviter)
+            if inviter_session:
+                inviter_session.send({"type": "invite_expired", "role": "sender", "target": target, "message": "Invitation expired"})
+            target_session = self.sessions.get(target)
+            if target_session:
+                target_session.send({"type": "invite_expired", "role": "receiver", "from": inviter, "message": "Invitation expired"})
 
 
 def main() -> None:
