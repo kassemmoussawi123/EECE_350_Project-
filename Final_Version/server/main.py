@@ -35,6 +35,7 @@ class ArenaServer:
         self.invites: dict[str, list] = {}
         self.active_matches: dict[str, Match] = {}
         self.spectator_lookup: dict[str, str] = {}
+        self.private_chat_peers: dict[str, set[str]] = {}
         self.lobby_messages: list[str] = []
 
     def start(self) -> None:
@@ -89,6 +90,20 @@ class ArenaServer:
 
     def remove_session(self, username: str) -> None:
         with self.lock:
+            private_peers = list(self.private_chat_peers.pop(username, set()))
+            for peer in private_peers:
+                self.private_chat_peers.get(peer, set()).discard(username)
+                peer_session = self.sessions.get(peer)
+                if peer_session:
+                    peer_session.send(
+                        {
+                            "type": "private_chat_status",
+                            "peer": username,
+                            "message": "Player disconnected",
+                            "online": False,
+                            "timestamp": self._chat_timestamp(),
+                        }
+                    )
             self.sessions.pop(username, None)
             self.invites.pop(username, None)
             self.stop_spectating(username)
@@ -154,6 +169,45 @@ class ArenaServer:
             self.lobby_messages = trim_messages(self.lobby_messages, MAX_LOBBY_MESSAGES)
             for session in self.sessions.values():
                 session.send({"type": "lobby_chat", "from": username, "text": clean})
+
+    def open_private_chat(self, username: str, target: str) -> None:
+        with self.lock:
+            if target == username:
+                self.sessions[username].send({"type": "private_chat_error", "target": target, "message": "Cannot start private chat with yourself."})
+                return
+            if target not in self.sessions:
+                self.sessions[username].send({"type": "private_chat_error", "target": target, "message": "Player is disconnected."})
+                return
+            self.private_chat_peers.setdefault(username, set()).add(target)
+            self.private_chat_peers.setdefault(target, set()).add(username)
+            self.sessions[username].send({"type": "private_chat_opened", "peer": target})
+
+    def send_private_lobby_chat(self, username: str, target: str, text: str) -> None:
+        clean = text.strip()[:240]
+        if not clean:
+            return
+        with self.lock:
+            if target == username:
+                self.sessions[username].send({"type": "private_chat_error", "target": target, "message": "Cannot send private messages to yourself."})
+                return
+            sender_session = self.sessions.get(username)
+            target_session = self.sessions.get(target)
+            if not sender_session:
+                return
+            if not target_session:
+                sender_session.send({"type": "private_chat_error", "target": target, "message": "Player is disconnected."})
+                return
+            self.private_chat_peers.setdefault(username, set()).add(target)
+            self.private_chat_peers.setdefault(target, set()).add(username)
+            payload = {
+                "type": "private_lobby_chat",
+                "from": username,
+                "to": target,
+                "text": clean,
+                "timestamp": self._chat_timestamp(),
+            }
+            sender_session.send(payload)
+            target_session.send(payload)
 
     def send_invite(self, inviter: str, target: str) -> None:
         with self.lock:
@@ -399,6 +453,9 @@ class ArenaServer:
             target_session = self.sessions.get(target)
             if target_session:
                 target_session.send({"type": "invite_expired", "role": "receiver", "from": inviter, "message": "Invitation expired"})
+
+    def _chat_timestamp(self) -> str:
+        return time.strftime("%H:%M")
 
 
 def main() -> None:

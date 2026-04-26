@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
+import struct
 
 import pygame
 
@@ -56,6 +58,24 @@ class SoundManager:
         if not self.enabled:
             return
         pygame.mixer.music.set_volume(max(0.0, min(1.0, volume)))
+
+    def play_private_notification(self, volume: float) -> None:
+        if not self.enabled:
+            return
+        try:
+            frequency, sample_format, channels = pygame.mixer.get_init()
+            sample_count = max(1, int(frequency * 0.08))
+            amplitude = int(9000 * max(0.0, min(1.0, volume)))
+            frames = bytearray()
+            for index in range(sample_count):
+                envelope = 1.0 - (index / sample_count)
+                sample = int(amplitude * envelope * math.sin(2 * math.pi * 880 * index / frequency))
+                packed = struct.pack("<h", sample)
+                for _ in range(channels):
+                    frames.extend(packed)
+            pygame.mixer.Sound(buffer=bytes(frames)).play()
+        except (pygame.error, ValueError, TypeError, struct.error):
+            pass
 
     def stop(self) -> None:
         if not self.enabled:

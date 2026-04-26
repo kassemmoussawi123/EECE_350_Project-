@@ -29,13 +29,17 @@ class Button:
             self.on_click()
 
     def draw(self, surface: pygame.Surface) -> None:
-        color = self.theme.colors["hover"] if self.rect.collidepoint(pygame.mouse.get_pos()) else self.theme.colors["panel"]
+        hovered = self.rect.collidepoint(pygame.mouse.get_pos())
+        color = self.theme.colors["hover"] if hovered else self.theme.colors["panel"]
         if self.disabled:
             color = (45, 50, 58)
-        pygame.draw.rect(surface, color, self.rect, border_radius=16)
-        pygame.draw.rect(surface, self.theme.colors[self.accent], self.rect, 2, border_radius=16)
+        shadow = self.rect.move(0, 3)
+        pygame.draw.rect(surface, (8, 12, 22), shadow, border_radius=16)
+        body = self.rect.move(0, -1 if hovered and not self.disabled else 0)
+        pygame.draw.rect(surface, color, body, border_radius=16)
+        pygame.draw.rect(surface, self.theme.colors[self.accent], body, 2, border_radius=16)
         label = self.theme.fonts["body"].render(self.text, True, self.theme.colors["text"])
-        surface.blit(label, label.get_rect(center=self.rect.center))
+        surface.blit(label, label.get_rect(center=body.center))
 
 
 @dataclass
@@ -67,7 +71,7 @@ class InputField:
         shown = self.text or self.placeholder
         text_color = self.theme.colors["text"] if self.text else self.theme.colors["muted"]
         label = self.theme.fonts["caption"].render(shown, True, text_color)
-        surface.blit(label, (self.rect.x + 14, self.rect.y + 12))
+        surface.blit(label, (self.rect.x + 14, self.rect.centery - label.get_height() // 2))
 
 
 @dataclass
@@ -97,10 +101,14 @@ class Slider:
     def draw(self, surface: pygame.Surface) -> None:
         label = self.theme.fonts["caption"].render(f"{self.label}: {self.value}", True, self.theme.colors["text"])
         surface.blit(label, (self.rect.x, self.rect.y - 26))
-        pygame.draw.rect(surface, self.theme.colors["panel"], self.rect, border_radius=12)
+        pygame.draw.rect(surface, self.theme.colors["input"], self.rect, border_radius=12)
+        pygame.draw.rect(surface, self.theme.colors["panel_border"], self.rect, 1, border_radius=12)
         fill = self.rect.copy()
         fill.width = int(self.rect.width * ((self.value - self.minimum) / max(1, (self.maximum - self.minimum))))
         pygame.draw.rect(surface, self.theme.colors["accent"], fill, border_radius=12)
+        knob_x = self.rect.x + fill.width
+        knob_x = max(self.rect.x + 10, min(self.rect.right - 10, knob_x))
+        pygame.draw.circle(surface, self.theme.colors["text"], (knob_x, self.rect.centery), 9)
 
 
 @dataclass
@@ -119,6 +127,7 @@ class Toggle:
         surface.blit(label, (self.rect.x, self.rect.y + 4))
         pill = pygame.Rect(self.rect.right - 70, self.rect.y, 70, self.rect.height)
         pygame.draw.rect(surface, self.theme.colors["success"] if self.value else self.theme.colors["panel"], pill, border_radius=18)
+        pygame.draw.rect(surface, self.theme.colors["panel_border"], pill, 1, border_radius=18)
         knob = pygame.Rect(0, 0, 28, 28)
         knob.centery = pill.centery
         knob.centerx = pill.right - 18 if self.value else pill.left + 18
@@ -132,7 +141,7 @@ class ListBox:
     items: List[str] = field(default_factory=list)
     selected_index: int = 0
     hovered_index: int = -1
-    row_height: int = 32
+    row_height: int = 34
 
     @property
     def selected(self) -> str:
@@ -172,7 +181,7 @@ class ListBox:
             elif index == self.hovered_index:
                 pygame.draw.rect(surface, self.theme.colors["hover"], row, border_radius=8)
             label = self.theme.fonts["caption"].render(item[:42], True, self.theme.colors["text"])
-            surface.blit(label, (row.x + 12, row.y + 4))
+            surface.blit(label, (row.x + 12, row.centery - label.get_height() // 2))
             if index == self.selected_index:
                 check = self.theme.fonts["caption"].render("✓", True, self.theme.colors["accent_soft"])
                 surface.blit(check, (row.right - 18, row.y + 3))

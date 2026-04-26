@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Dict
 
@@ -70,6 +71,10 @@ class GameClientApp:
         self.lobby_users: list[Dict] = []
         self.active_matches: list[Dict] = []
         self.lobby_messages: list[str] = []
+        self.private_chats: dict[str, list[Dict]] = {}
+        self.private_unread: dict[str, int] = {}
+        self.private_chat_peer = ""
+        self.private_chat_minimized = False
         self.match_snapshot: Dict = {
             "players": [],
             "snakes": {},
@@ -178,6 +183,39 @@ class GameClientApp:
         self.pending_invite_deadline = 0.0
         self.network.send({"type": "invite_player", "target": target})
         self.set_screen("matchmaking")
+
+    def open_private_chat(self, peer: str) -> None:
+        peer = peer.strip()
+        if not peer or peer == self.username:
+            self.status_message = "Choose another player for private chat."
+            return
+        self.private_chat_peer = peer
+        self.private_chat_minimized = False
+        self.private_chats.setdefault(peer, [])
+        self.private_unread[peer] = 0
+        if self.connected:
+            self.network.send({"type": "open_private_chat", "target": peer})
+
+    def close_private_chat(self) -> None:
+        self.private_chat_peer = ""
+        self.private_chat_minimized = False
+
+    def minimize_private_chat(self) -> None:
+        self.private_chat_minimized = True
+
+    def restore_private_chat(self) -> None:
+        if self.private_chat_peer:
+            self.private_chat_minimized = False
+            self.private_unread[self.private_chat_peer] = 0
+
+    def send_private_message(self, peer: str, text: str) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        if peer == self.username:
+            self.status_message = "Choose another player for private chat."
+            return
+        self.network.send({"type": "send_private_lobby_chat", "target": peer, "text": clean})
 
     def forfeit_match(self) -> None:
         self.network.send({"type": "forfeit_match"})
@@ -298,6 +336,62 @@ class GameClientApp:
                 self.pending_invite_text = ""
         elif msg_type == "lobby_chat":
             self.lobby_messages.append(f"{message['from']}: {message['text']}")
+        elif msg_type == "private_chat_opened":
+            peer = message.get("peer", "")
+            if peer:
+                self.private_chats.setdefault(peer, [])
+        elif msg_type == "private_lobby_chat":
+            sender = message.get("from", "")
+            recipient = message.get("to", "")
+            peer = recipient if sender == self.username else sender
+            if not peer:
+                return
+            self._append_private_entry(
+                peer,
+                {
+                    "kind": "message",
+                    "timestamp": message.get("timestamp", self._private_timestamp()),
+                    "sender": sender,
+                    "text": message.get("text", ""),
+                },
+            )
+            if sender != self.username:
+                if self.private_chat_peer == peer and not self.private_chat_minimized and self.current_screen is self.screens["lobby"]:
+                    self.private_unread[peer] = 0
+                else:
+                    self.private_unread[peer] = self.private_unread.get(peer, 0) + 1
+                self.status_message = f"Private message from {peer}."
+                if not self.settings.data["ui"].get("mute", False):
+                    self.sound.play_private_notification(self.settings.data["ui"].get("sfx_volume", 80) / 100.0)
+        elif msg_type == "private_chat_status":
+            peer = message.get("peer", "")
+            if peer:
+                self._append_private_entry(
+                    peer,
+                    {
+                        "kind": "status",
+                        "timestamp": message.get("timestamp", self._private_timestamp()),
+                        "sender": "",
+                        "text": message.get("message", "Player disconnected"),
+                    },
+                )
+                if not (self.private_chat_peer == peer and not self.private_chat_minimized and self.current_screen is self.screens["lobby"]):
+                    self.private_unread[peer] = self.private_unread.get(peer, 0) + 1
+                self.status_message = message.get("message", "Player disconnected")
+        elif msg_type == "private_chat_error":
+            target = message.get("target", "")
+            error = message.get("message", "Private chat error.")
+            self.status_message = error
+            if target:
+                self._append_private_entry(
+                    target,
+                    {
+                        "kind": "status",
+                        "timestamp": self._private_timestamp(),
+                        "sender": "",
+                        "text": error,
+                    },
+                )
         elif msg_type == "invite_sent":
             self.pending_invite_target = message.get("target", "")
             self.set_invite_deadline(message.get("expires_in", 0), incoming=False)
@@ -380,3 +474,11 @@ class GameClientApp:
                 self.set_screen("lobby")
             else:
                 self.set_screen("endgame")
+
+    def _append_private_entry(self, peer: str, entry: Dict) -> None:
+        history = self.private_chats.setdefault(peer, [])
+        history.append(entry)
+        self.private_chats[peer] = history[-120:]
+
+    def _private_timestamp(self) -> str:
+        return time.strftime("%H:%M")

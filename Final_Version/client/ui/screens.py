@@ -171,8 +171,17 @@ class LobbyScreen(BaseScreen):
         self.match_panel = pygame.Rect(360, 120, 320, 270)
         self.chat_panel = pygame.Rect(40, 420, 640, 210)
         self.user_list = ListBox(pygame.Rect(58, 168, 264, 198), app.theme)
+        self.user_rows: list[dict] = []
         self.match_list = ListBox(pygame.Rect(378, 168, 284, 198), app.theme)
         self.chat_input = InputField(pygame.Rect(60, 570, 450, 40), app.theme, placeholder="Send a lobby message")
+        self.private_input = InputField(pygame.Rect(742, 574, 328, 38), app.theme, placeholder="Private message")
+        self.private_input.max_length = 120
+        self.private_scroll = 0
+        self.private_panel = pygame.Rect(700, 96, 460, 536)
+        self.private_messages_rect = pygame.Rect(724, 170, 412, 348)
+        self.private_minimize_rect = pygame.Rect(1082, 114, 24, 24)
+        self.private_close_rect = pygame.Rect(1114, 114, 24, 24)
+        self.private_send_rect = pygame.Rect(1082, 574, 58, 38)
         self.buttons = [
             Button(pygame.Rect(710, 150, 220, 48), "Invite Opponent", self._invite, app.theme),
             Button(pygame.Rect(710, 210, 220, 48), "Spectate Match", self._spectate, app.theme, accent="accent_2"),
@@ -188,8 +197,13 @@ class LobbyScreen(BaseScreen):
         self.app.request_lobby_refresh()
 
     def _invite(self) -> None:
-        if self.user_list.selected:
-            self.app.send_invite(self.user_list.selected)
+        selected = self._selected_username()
+        if not selected:
+            return
+        if self._selected_status() != "lobby":
+            self.app.status_message = "Target player is busy."
+            return
+        self.app.send_invite(selected)
 
     def _spectate(self) -> None:
         selected = self.match_list.selected
@@ -204,8 +218,23 @@ class LobbyScreen(BaseScreen):
             self.app.network.send({"type": "send_lobby_chat", "text": text})
             self.chat_input.text = ""
 
+    def _send_private(self) -> None:
+        peer = self.app.private_chat_peer
+        text = self.private_input.text.strip()
+        if peer and text:
+            self.app.send_private_message(peer, text)
+            self.private_input.text = ""
+            self.private_scroll = 0
+
     def handle_event(self, event: pygame.event.Event) -> None:
+        if self._handle_private_chat_event(event):
+            return
+        clicked_user = self._clicked_username(event)
         self.user_list.handle_event(event)
+        if clicked_user:
+            self.app.open_private_chat(clicked_user)
+            self.private_scroll = 0
+            return
         self.match_list.handle_event(event)
         self.chat_input.handle_event(event)
         for button in self.buttons:
@@ -230,12 +259,15 @@ class LobbyScreen(BaseScreen):
         if self.refresh_timer >= 1.0:
             self.app.request_lobby_refresh()
             self.refresh_timer = 0.0
-        others = [
-            item["username"]
-            for item in self.app.lobby_users
-            if item["username"] != self.app.username and item.get("status") == "lobby"
-        ]
-        self.user_list.items = others
+        self.user_rows = []
+        for item in self.app.lobby_users:
+            username = item["username"]
+            if username == self.app.username:
+                continue
+            status = item.get("status", "lobby")
+            status_label = self._status_label(status)
+            self.user_rows.append({"username": username, "status": status, "status_label": status_label, "label": username})
+        self.user_list.items = [item["label"] for item in self.user_rows]
         self.match_list.items = [
             f"{m['match_id']} | {' vs '.join(m['players'])} | {m.get('map', 'Desert')} | {m.get('target_score', TARGET_SCORE_TO_WIN)} pts"
             for m in self.app.active_matches
@@ -245,11 +277,13 @@ class LobbyScreen(BaseScreen):
         self.app.renderer.draw_background(surface, self.app.assets.get("background"), 115)
         self.app.renderer.draw_panel(surface, self.user_panel, "Online Users")
         self.user_list.draw(surface)
+        self._draw_user_status_tags(surface)
+        self._draw_private_badges(surface)
         self.app.renderer.draw_panel(surface, self.match_panel, "Live Matches")
         self.match_list.draw(surface)
         self.app.renderer.draw_panel(surface, self.chat_panel, "Lobby Chat")
         self.chat_input.draw(surface)
-        users_count = self.app.theme.fonts["tiny"].render(f"{len(self.user_list.items)} available", True, self.app.theme.colors["muted"])
+        users_count = self.app.theme.fonts["tiny"].render(f"{len(self.user_list.items)} online", True, self.app.theme.colors["muted"])
         matches_count = self.app.theme.fonts["tiny"].render(f"{len(self.match_list.items)} active", True, self.app.theme.colors["muted"])
         surface.blit(users_count, (self.user_panel.x + 178, self.user_panel.y + 18))
         surface.blit(matches_count, (self.match_panel.x + 196, self.match_panel.y + 18))
@@ -269,6 +303,163 @@ class LobbyScreen(BaseScreen):
             pygame.draw.rect(surface, self.app.theme.colors["accent_soft"], status_box, 1, border_radius=12)
             label = self.app.theme.fonts["tiny"].render(status[:92], True, self.app.theme.colors["accent_soft"])
             surface.blit(label, (54, 84))
+        self._draw_private_chat(surface)
+
+    def _selected_username(self) -> str:
+        if not self.user_rows:
+            return ""
+        index = max(0, min(self.user_list.selected_index, len(self.user_rows) - 1))
+        return self.user_rows[index]["username"]
+
+    def _selected_status(self) -> str:
+        if not self.user_rows:
+            return ""
+        index = max(0, min(self.user_list.selected_index, len(self.user_rows) - 1))
+        return self.user_rows[index].get("status", "lobby")
+
+    def _clicked_username(self, event: pygame.event.Event) -> str:
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return ""
+        if not self.user_list.rect.collidepoint(event.pos):
+            return ""
+        row = (event.pos[1] - self.user_list.rect.y - 12) // self.user_list.row_height
+        if 0 <= row < len(self.user_rows):
+            return self.user_rows[row]["username"]
+        return ""
+
+    def _handle_private_chat_event(self, event: pygame.event.Event) -> bool:
+        peer = self.app.private_chat_peer
+        if not peer:
+            return False
+        if self.app.private_chat_minimized:
+            bar = pygame.Rect(self.private_panel.x, self.private_panel.bottom - 42, self.private_panel.width, 42)
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and bar.collidepoint(event.pos):
+                self.app.restore_private_chat()
+                return True
+            return False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.private_close_rect.collidepoint(event.pos):
+                self.app.close_private_chat()
+                return True
+            if self.private_minimize_rect.collidepoint(event.pos):
+                self.app.minimize_private_chat()
+                return True
+            if self.private_send_rect.collidepoint(event.pos):
+                self._send_private()
+                return True
+        if event.type == pygame.MOUSEWHEEL and self.private_messages_rect.collidepoint(pygame.mouse.get_pos()):
+            history = self.app.private_chats.get(peer, [])
+            max_scroll = max(0, len(history) - 10)
+            self.private_scroll = max(0, min(max_scroll, self.private_scroll + event.y))
+            return True
+        if self.private_panel.collidepoint(pygame.mouse.get_pos()) or self.private_input.active:
+            self.private_input.handle_event(event)
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN and self.private_input.active:
+                self._send_private()
+                return True
+            return event.type in {pygame.MOUSEBUTTONDOWN, pygame.KEYDOWN, pygame.MOUSEWHEEL}
+        return False
+
+    def _draw_private_badges(self, surface: pygame.Surface) -> None:
+        for index, row in enumerate(self.user_rows[:10]):
+            unread = self.app.private_unread.get(row["username"], 0)
+            if unread <= 0:
+                continue
+            row_rect = pygame.Rect(
+                self.user_list.rect.x + 10,
+                self.user_list.rect.y + 10 + index * self.user_list.row_height,
+                self.user_list.rect.width - 20,
+                self.user_list.row_height - 4,
+            )
+            badge_center = (row_rect.right - 42, row_rect.centery)
+            pygame.draw.circle(surface, self.app.theme.colors["danger"], badge_center, 10)
+            count = self.app.theme.fonts["tiny"].render(str(min(unread, 9)), True, self.app.theme.colors["text"])
+            surface.blit(count, count.get_rect(center=badge_center))
+
+    def _status_label(self, status: str) -> str:
+        labels = {
+            "lobby": "Online",
+            "in_match": "In Match",
+            "spectating": "Spectating",
+            "offline": "Offline",
+        }
+        return labels.get(status, status.replace("_", " ").title())
+
+    def _status_color(self, status: str) -> tuple[int, int, int]:
+        colors = {
+            "lobby": self.app.theme.colors["success"],
+            "in_match": self.app.theme.colors["warning"],
+            "spectating": self.app.theme.colors["accent_2"],
+            "offline": self.app.theme.colors["muted"],
+        }
+        return colors.get(status, self.app.theme.colors["accent_soft"])
+
+    def _draw_user_status_tags(self, surface: pygame.Surface) -> None:
+        for index, row in enumerate(self.user_rows[:10]):
+            row_rect = pygame.Rect(
+                self.user_list.rect.x + 10,
+                self.user_list.rect.y + 10 + index * self.user_list.row_height,
+                self.user_list.rect.width - 20,
+                self.user_list.row_height - 4,
+            )
+            status = row.get("status", "lobby")
+            text = row.get("status_label", "Online")
+            color = self._status_color(status)
+            tag_width = 72 if status == "lobby" else 88 if status == "in_match" else 94
+            tag = pygame.Rect(row_rect.right - tag_width - 10, row_rect.y + 6, tag_width, 20)
+            pygame.draw.rect(surface, self.app.theme.colors["input"], tag, border_radius=8)
+            pygame.draw.rect(surface, color, tag, 1, border_radius=8)
+            dot = (tag.x + 10, tag.centery)
+            pygame.draw.circle(surface, color, dot, 4)
+            label = self.app.theme.fonts["tiny"].render(text, True, color)
+            surface.blit(label, (tag.x + 18, tag.y + 3))
+
+    def _draw_private_chat(self, surface: pygame.Surface) -> None:
+        peer = self.app.private_chat_peer
+        if not peer:
+            return
+        if self.app.private_chat_minimized:
+            bar = pygame.Rect(self.private_panel.x, self.private_panel.bottom - 42, self.private_panel.width, 42)
+            pygame.draw.rect(surface, self.app.theme.colors["panel"], bar, border_radius=14)
+            pygame.draw.rect(surface, self.app.theme.colors["accent_2"], bar, 2, border_radius=14)
+            unread = self.app.private_unread.get(peer, 0)
+            suffix = f" ({unread})" if unread else ""
+            label = self.app.theme.fonts["caption"].render(f"Private chat: {peer}{suffix}", True, self.app.theme.colors["text"])
+            surface.blit(label, (bar.x + 18, bar.y + 11))
+            return
+        self.app.renderer.draw_panel(surface, self.private_panel, f"Private Chat: {peer}")
+        for rect, text in ((self.private_minimize_rect, "-"), (self.private_close_rect, "x")):
+            pygame.draw.rect(surface, self.app.theme.colors["input"], rect, border_radius=8)
+            pygame.draw.rect(surface, self.app.theme.colors["panel_border"], rect, 1, border_radius=8)
+            label = self.app.theme.fonts["caption"].render(text, True, self.app.theme.colors["text"])
+            surface.blit(label, label.get_rect(center=rect.center))
+        pygame.draw.rect(surface, self.app.theme.colors["input"], self.private_messages_rect, border_radius=12)
+        pygame.draw.rect(surface, self.app.theme.colors["panel_border"], self.private_messages_rect, 1, border_radius=12)
+        history = self.app.private_chats.get(peer, [])
+        max_visible = 10
+        max_scroll = max(0, len(history) - max_visible)
+        self.private_scroll = max(0, min(max_scroll, self.private_scroll))
+        end = len(history) - self.private_scroll
+        start = max(0, end - max_visible)
+        y = self.private_messages_rect.y + 12
+        for entry in history[start:end]:
+            timestamp = entry.get("timestamp", "")
+            if entry.get("kind") == "status":
+                line = f"[{timestamp}] {entry.get('text', '')}"
+                color = self.app.theme.colors["warning"]
+            else:
+                line = f"[{timestamp}] {entry.get('sender', '')}: {entry.get('text', '')}"
+                color = self.app.theme.colors["text"] if entry.get("sender") == self.app.username else self.app.theme.colors["accent_soft"]
+            label = self.app.theme.fonts["tiny"].render(line[:72], True, color)
+            surface.blit(label, (self.private_messages_rect.x + 12, y))
+            y += 31
+        hint = self.app.theme.fonts["tiny"].render("Mouse wheel scrolls history.", True, self.app.theme.colors["muted"])
+        surface.blit(hint, (self.private_panel.x + 24, self.private_messages_rect.bottom + 10))
+        self.private_input.draw(surface)
+        pygame.draw.rect(surface, self.app.theme.colors["panel"], self.private_send_rect, border_radius=12)
+        pygame.draw.rect(surface, self.app.theme.colors["accent"], self.private_send_rect, 2, border_radius=12)
+        send_label = self.app.theme.fonts["tiny"].render("Send", True, self.app.theme.colors["text"])
+        surface.blit(send_label, send_label.get_rect(center=self.private_send_rect.center))
 
 
 class CustomizationScreen(BaseScreen):
@@ -365,15 +556,15 @@ class MatchSettingsScreen(BaseScreen):
     def __init__(self, app: "GameClientApp") -> None:
         super().__init__(app)
         selected_map = MAP_CHOICES.index(app.profile["map"]) if app.profile["map"] in MAP_CHOICES else 0
-        self.panel = pygame.Rect(120, 80, 450, 610)
-        self.hint_panel = pygame.Rect(620, 80, 500, 610)
-        self.map_list = ListBox(pygame.Rect(160, 220, 260, 110), app.theme, items=list(MAP_CHOICES), selected_index=selected_map)
-        self.duration_field = InputField(pygame.Rect(160, 372, 260, 44), app.theme, text=str(app.profile["duration"]), placeholder="Duration")
-        self.target_field = InputField(pygame.Rect(160, 452, 260, 44), app.theme, text=str(app.profile["target_score"]), placeholder="Target Score")
+        self.panel = pygame.Rect(120, 56, 450, 664)
+        self.hint_panel = pygame.Rect(620, 56, 500, 664)
+        self.map_list = ListBox(pygame.Rect(160, 220, 280, 102), app.theme, items=list(MAP_CHOICES), selected_index=selected_map)
+        self.duration_field = InputField(pygame.Rect(160, 378, 280, 46), app.theme, text=str(app.profile["duration"]), placeholder="Duration")
+        self.target_field = InputField(pygame.Rect(160, 464, 280, 46), app.theme, text=str(app.profile["target_score"]), placeholder="Target Score")
         self.target_field.max_length = len(str(MAX_TARGET_SCORE))
-        self.visual_field = InputField(pygame.Rect(160, 592, 260, 44), app.theme, text=app.profile["visual_mod"], placeholder="Visual Variation")
-        self.save_button = Button(pygame.Rect(160, 652, 180, 46), "Confirm", self._save, app.theme)
-        self.back_button = Button(pygame.Rect(360, 652, 180, 46), "Back", lambda: app.set_screen("lobby"), app.theme, accent="accent_2")
+        self.visual_field = InputField(pygame.Rect(160, 608, 280, 46), app.theme, text=app.profile["visual_mod"], placeholder="Visual Variation")
+        self.save_button = Button(pygame.Rect(160, 666, 142, 42), "Confirm", self._save, app.theme)
+        self.back_button = Button(pygame.Rect(318, 666, 122, 42), "Back", lambda: app.set_screen("lobby"), app.theme, accent="accent_2")
 
     def _sanitize_target_field(self) -> None:
         raw = "".join(ch for ch in self.target_field.text if ch.isdigit())
@@ -417,15 +608,15 @@ class MatchSettingsScreen(BaseScreen):
         self.app.renderer.draw_background(surface, self.app.assets.get("background"), 120)
         self.app.renderer.draw_panel(surface, self.panel, "Match Settings")
         self.app.renderer.draw_panel(surface, self.hint_panel, "Map Preview")
-        for label, y in (("Map", 190), ("Duration (minutes)", 342), ("Target Score", 422), ("Visual Variation", 562)):
+        for label, y in (("Map", 184), ("Duration (minutes)", 346), ("Target Score", 432), ("Visual Variation", 576)):
             text = self.app.theme.fonts["caption"].render(label, True, self.app.theme.colors["text"])
             surface.blit(text, (160, y))
         self.map_list.draw(surface)
-        selected_map_box = pygame.Rect(160, 332, 260, 30)
+        selected_map_box = pygame.Rect(160, 330, 280, 28)
         pygame.draw.rect(surface, self.app.theme.colors["input"], selected_map_box, border_radius=10)
         pygame.draw.rect(surface, self.app.theme.colors["accent_soft"], selected_map_box, 1, border_radius=10)
         selected_map = self.app.theme.fonts["tiny"].render(f"Selected Map: {self.map_list.selected}", True, self.app.theme.colors["accent_soft"])
-        surface.blit(selected_map, (174, 339))
+        surface.blit(selected_map, (174, 336))
         for field in (self.duration_field, self.target_field, self.visual_field):
             field.draw(surface)
         self.save_button.draw(surface)
@@ -447,13 +638,13 @@ class MatchSettingsScreen(BaseScreen):
         }
         draw_paragraph(surface, self.app.theme, descriptions.get(preview_map, ""), self.hint_panel.x + 34, self.hint_panel.y + 392, self.hint_panel.width - 68)
         draw_paragraph(surface, self.app.theme, "The selected map is saved to your profile and sent to the server before matchmaking begins.", self.hint_panel.x + 34, self.hint_panel.y + 462, self.hint_panel.width - 68)
-        target_note = pygame.Rect(160, 506, 300, 42)
+        target_note = pygame.Rect(160, 522, 280, 44)
         pygame.draw.rect(surface, self.app.theme.colors["input"], target_note, border_radius=12)
         pygame.draw.rect(surface, self.app.theme.colors["panel_border"], target_note, 1, border_radius=12)
         note_title = self.app.theme.fonts["tiny"].render("Score Limit", True, self.app.theme.colors["accent_soft"])
-        note_body = self.app.theme.fonts["tiny"].render(f"Custom range: 1 to {MAX_TARGET_SCORE}", True, self.app.theme.colors["muted"])
+        note_body = self.app.theme.fonts["tiny"].render(f"Any value from 1 to {MAX_TARGET_SCORE}", True, self.app.theme.colors["muted"])
         surface.blit(note_title, (target_note.x + 12, target_note.y + 6))
-        surface.blit(note_body, (target_note.x + 12, target_note.y + 20))
+        surface.blit(note_body, (target_note.x + 12, target_note.y + 22))
 
 
 class MatchmakingScreen(BaseScreen):

@@ -23,8 +23,12 @@ def handle_message(server: "ArenaServer", session: "ClientSession", message: dic
         server.send_lobby_state(session.username)
     elif msg_type == "send_lobby_chat":
         server.send_lobby_chat(session.username, message.get("text", ""))
-    elif msg_type in {"send_private_lobby_chat", "send_private_chat", "private_message", "direct_message"}:
-        session.send({"type": "error", "message": "Private lobby chat is disabled."})
+    elif msg_type == "open_private_chat":
+        server.open_private_chat(session.username, message.get("target", ""))
+    elif msg_type == "send_private_lobby_chat":
+        server.send_private_lobby_chat(session.username, message.get("target", ""), message.get("text", ""))
+    elif msg_type in {"send_private_chat", "private_message", "direct_message"}:
+        session.send({"type": "private_chat_error", "target": message.get("target", ""), "message": "Unsupported private chat message type."})
     elif msg_type == "invite_player":
         server.send_invite(session.username, message.get("target", ""))
     elif msg_type == "cancel_invite":
